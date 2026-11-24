@@ -1,0 +1,16 @@
+# Python 虚拟环境
+.venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 游戏存档（本地测试数据，不上传）
+sessions/
+
+# 密钥和本地配置，绝对不能上传
+.env
+
+# PyCharm 和 Mac 的文件
+.idea/
+.DS_Store

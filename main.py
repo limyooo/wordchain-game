@@ -1,7 +1,9 @@
 import json
 import os
+import random
 from datetime import datetime
 
+import anthropic
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -10,7 +12,7 @@ from starlette.responses import FileResponse
 app = FastAPI(title="wordchain")
 
 
-# ---------- 返回数据的格式 ----------
+# ---------- 数据模型 ----------
 class Message(BaseModel):
     role: str          # "user" 或 "assistant"
     content: str
@@ -28,15 +30,43 @@ class Session(SessionInfo):
     messages: list[Message]
 
 
+class GameSession(Session):
+    """存进文件的完整数据：比返回给前端的 Session 多了游戏状态"""
+    used_words: list[str]
+
+
 class OkResponse(BaseModel):
     ok: bool
+
+
+class ChatRequest(BaseModel):
+    message: str
+
+
+class ChatReply(BaseModel):
+    reply: str
+
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # 存放会话的目录（相对 main.py，而不是相对启动时的 cwd）
-SESSIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions")
+SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
+# 英文词典：启动时读一次，放进 set 里，查询很快
+# 如果还没下载 words.txt，就先跳过“是不是真单词”的检查
+WORDS_PATH = os.path.join(BASE_DIR, "words.txt")
+if os.path.exists(WORDS_PATH):
+    with open(WORDS_PATH, encoding="utf-8") as f:
+        DICTIONARY = {line.strip().lower() for line in f if line.strip()}
+else:
+    DICTIONARY = set()
+    print("WARNING: words.txt not found, dictionary check is disabled")
 
+
+# ---------- 存储 ----------
 def session_path(sid: str) -> str:
     return os.path.join(SESSIONS_DIR, f"{sid}.json")
 
@@ -64,9 +94,67 @@ def load_session(sid: str) -> dict:
         return json.load(f)
 
 
+# ---------- 游戏规则 ----------
+def check_word(word: str, used_words: list[str]) -> str | None:
+    """检查一个词是否合规。合规返回 None，不合规返回错误提示。"""
+    last_word = used_words[-1]
+
+    if not word.isalpha():
+        return "Please type one English word (letters only)."
+    if len(word) < 3:
+        return "Words need at least 3 letters. Try a longer one!"
+    if word[0] != last_word[-1]:
+        return f"'{word}' doesn't start with '{last_word[-1]}'. Try again!"
+    if DICTIONARY and word not in DICTIONARY:
+        return f"'{word}' isn't in my dictionary. Try a real English word!"
+    if word in used_words:
+        return f"'{word}' was already used. Try another word!"
+    return None
+
+
+# ---------- AI ----------
+if not os.environ.get("ANTHROPIC_API_KEY"):
+    print("WARNING: ANTHROPIC_API_KEY is not set, AI will not work")
+
+client = anthropic.Anthropic()  # 自动从环境变量 ANTHROPIC_API_KEY 读取 key
+MODEL = "claude-haiku-5-5"
+
+# 开局词：从这些常用词里随机挑一个
+START_WORDS = ["apple", "banana", "house", "river", "music", "garden", "pencil",
+               "window", "tiger", "ocean", "planet", "candle", "forest", "rabbit",
+               "coffee", "school", "mountain", "dragon", "summer", "bridge"]
+
+
+def ai_next_word(used_words: list[str]) -> str | None:
+    """让 Claude 接下一个词，并用同样的规则检查。试 3 次都不合规就返回 None。"""
+    last_letter = used_words[-1][-1]
+    prompt = (
+        "We are playing an English word chain game. "
+        f"Give me ONE common English word that starts with '{last_letter}'. "
+        f"Do not use any of these words: {', '.join(used_words)}. "
+        "Reply with the word only, nothing else."
+    )
+
+    for _ in range(3):
+        try:
+            resp = client.messages.create(
+                model=MODEL,
+                max_tokens=20,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except anthropic.APIError:
+            raise HTTPException(status_code=503, detail="AI is unavailable, please try again")
+
+        word = resp.content[0].text.strip().lower().strip(".,!?'\"")
+        if check_word(word, used_words) is None:  # AI 的词也要过同样的规则
+            return word
+    return None
+
+
+# ---------- 接口 ----------
 @app.get("/")
 def root():
-    return FileResponse("static/index.html")
+    return FileResponse(os.path.join(BASE_DIR, "static", "index.html"))
 
 
 # 会话列表：最新的在前
@@ -83,15 +171,11 @@ def list_sessions():
 
 # 新建会话
 @app.post("/api/sessions", response_model=Session)
-# 新建会话
-@app.post("/api/sessions", response_model=Session)
 def create_session():
     now = datetime.now()
-    # 1. 生成会话 id / 名称
     sid = generate_session_id(now)
 
-    # TODO: 之后换成让 AI 随机出第一个词
-    first_word = "apple"
+    first_word = random.choice(START_WORDS)  # 每局随机一个开局词
 
     data = {
         "id": sid,
@@ -104,9 +188,7 @@ def create_session():
                        f"Your turn: give me a word starting with '{first_word[-1]}'.",
         }],
     }
-    # 2. 存到文件
     save_session(data)
-    # 3. 返回 JSON
     return data
 
 
@@ -123,7 +205,30 @@ def delete_session(sid: str):
 def get_messages(sid: str):
     return load_session(sid)["messages"]
 
-# TODO: POST /api/sessions/{sid}/chat  body: {message} -> {reply}（需要接 AI）
+
+# 聊天：玩家出一个词，AI 接下一个
+@app.post("/api/sessions/{sid}/chat", response_model=ChatReply)
+def chat(sid: str, req: ChatRequest):
+    data = load_session(sid)
+    word = req.message.strip().lower()  # 去掉空格、转小写，"Egg " 也算 "egg"
+    data["messages"].append({"role": "user", "content": req.message})
+
+    error = check_word(word, data["used_words"])
+    if error:
+        reply = error
+    else:
+        data["used_words"].append(word)
+        ai_word = ai_next_word(data["used_words"])
+        if ai_word is None:
+            reply = f"I can't think of a word starting with '{word[-1]}'. You win!"
+        else:
+            data["used_words"].append(ai_word)
+            reply = (f"Nice! My word is '{ai_word}'. "
+                     f"Your turn: a word starting with '{ai_word[-1]}'.")
+
+    data["messages"].append({"role": "assistant", "content": reply})
+    save_session(data)
+    return {"reply": reply}
 
 
 if __name__ == "__main__":
