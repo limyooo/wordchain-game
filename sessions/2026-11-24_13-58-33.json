@@ -1,0 +1,14 @@
+{
+  "id": "2026-11-24_13-58-33",
+  "name": "2026-11-24_13-58-33",
+  "created_at": "2026-11-24T13:58:33.129953",
+  "used_words": [
+    "apple"
+  ],
+  "messages": [
+    {
+      "role": "assistant",
+      "content": "Let's play! My word is 'apple'. Your turn: give me a word starting with 'e'."
+    }
+  ]
+}

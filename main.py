@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.responses import FileResponse
 
-app = FastAPI(title="hanzi-mihe")
+app = FastAPI(title="wordchain")
 
 
 # ---------- 返回数据的格式 ----------
@@ -83,23 +83,30 @@ def list_sessions():
 
 # 新建会话
 @app.post("/api/sessions", response_model=Session)
+# 新建会话
+@app.post("/api/sessions", response_model=Session)
 def create_session():
     now = datetime.now()
     # 1. 生成会话 id / 名称
     sid = generate_session_id(now)
 
-    # TODO: 之后换成让 AI 出第一道题
-    first_riddle = "谜面：一箭穿心（打一字）"
+    # TODO: 之后换成让 AI 随机出第一个词
+    first_word = "apple"
 
     data = {
         "id": sid,
         "name": sid,
         "created_at": now.isoformat(),
-        "messages": [{"role": "assistant", "content": first_riddle}],
+        "used_words": [first_word],  # 本局用过的词，最后一个就是“上一个词”
+        "messages": [{
+            "role": "assistant",
+            "content": f"Let's play! My word is '{first_word}'. "
+                       f"Your turn: give me a word starting with '{first_word[-1]}'.",
+        }],
     }
     # 2. 存到文件
     save_session(data)
-    # 3. 返回 JSON（FastAPI 会把 dict 自动转成 JSON）
+    # 3. 返回 JSON
     return data
 
 
@@ -115,7 +122,6 @@ def delete_session(sid: str):
 @app.get("/api/sessions/{sid}/messages", response_model=list[Message])
 def get_messages(sid: str):
     return load_session(sid)["messages"]
-
 
 # TODO: POST /api/sessions/{sid}/chat  body: {message} -> {reply}（需要接 AI）
 
