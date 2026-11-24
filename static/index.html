@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Hanzi Riddle Box</title>
+<title>WordChain</title>
 <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
 <div class="app">
   <!-- Left: sessions -->
   <aside class="sidebar">
-    <h1>🪄 Riddle Box Console</h1>
+    <h1>🔗 WordChain</h1>
     <button class="btn-new" id="btnNew">✨ New game</button>
     <div class="section-title">Game history</div>
     <ul class="session-list" id="sessionList"></ul>
@@ -20,19 +20,19 @@
   <main class="chat">
     <div class="chat-header">
       <div>
-        <h2>🪄 Hanzi Riddle Box</h2>
-        <div class="sub" id="sessionName">No session selected</div>
+        <h2>🔗 WordChain</h2>
+        <div class="sub" id="sessionName">No game selected</div>
       </div>
     </div>
     <div class="messages" id="messages">
       <div class="welcome">
-        <div class="big">🧩</div>
-        Click “New game” on the left to start guessing<br/>or pick a game from your history
+        <div class="big">🔤</div>
+        Click “New game” on the left to start a chain<br/>or pick a game from your history
       </div>
     </div>
     <div class="composer">
       <div class="input-wrap">
-        <input id="input" placeholder="Type your answer, or ask for a new riddle…" disabled autocomplete="off" />
+        <input id="input" placeholder="Type a word that starts with the last letter…" disabled autocomplete="off" />
         <button class="btn-send" id="btnSend" disabled aria-label="Send">➤</button>
       </div>
     </div>
@@ -40,25 +40,25 @@
 
   <!-- Right: about -->
   <aside class="intro">
-    <h3>🪄 About the game</h3>
-    <p>Hanzi Riddle Box is an AI-powered riddle game for anyone who loves Chinese characters. Here you’ll take on fun character-guessing challenges with an AI host!</p>
+    <h3>🔗 About the game</h3>
+    <p>WordChain is an AI-powered English word chain game for anyone who wants to build their vocabulary. Take turns with an AI partner and see how long you can keep the chain going!</p>
     <h4>🎮 How to play</h4>
-    <p>The AI gives you a classic character riddle (like “一箭穿心”, an arrow through the heart). Guess the character from the clue, and the AI will give hints based on your answers before revealing the solution.</p>
+    <p>The AI starts with a word, like “apple”. Reply with a word that starts with its last letter (“egg”), then the AI continues from your word’s last letter (“goat”), and so on. Each word must be a real English word and can only be used once per game.</p>
     <h4>✨ Features</h4>
     <ul>
-      <li><b>Smart checking:</b> the AI knows whether your answer is right</li>
-      <li><b>Helpful hints:</b> wrong guesses get a clue, not the answer</li>
-      <li><b>Endless riddles:</b> a different riddle every time</li>
+      <li><b>Instant rule checks:</b> wrong first letters and repeated words are caught right away</li>
+      <li><b>Smart AI partner:</b> the AI picks words that keep the game fun and challenging</li>
+      <li><b>Helpful hints:</b> stuck? Ask for a hint instead of giving up</li>
       <li><b>Saved games:</b> your history is saved, so you can return to any game</li>
     </ul>
     <h4>👥 Great for</h4>
     <ul>
-      <li>Chinese character enthusiasts</li>
-      <li>Chinese language learners</li>
-      <li>Livening up a classroom</li>
-      <li>Casual brain teasers</li>
+      <li>English learners</li>
+      <li>Vocabulary practice</li>
+      <li>Warming up a classroom</li>
+      <li>Quick word games with friends</li>
     </ul>
-    <p class="footer">Test your knowledge of Chinese characters and enjoy their charm along the way!</p>
+    <p class="footer">Keep the chain going and learn new words along the way!</p>
   </aside>
 </div>
 <div class="toast" id="toast"></div>
