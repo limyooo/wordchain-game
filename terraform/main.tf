@@ -1,17 +1,21 @@
-terraform{
-    required_version = ">=1.6"
-    required_providers{
-        aws = {
-            source = "hashicorp/aws"
-            version = "~> 6.0"
-            }
-        }
-    }
+terraform {
+  required_version = ">= 1.6"
 
-provider "aws"{
-    region = "us-east-2"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
     }
-data "aws_caller_identity" "current" {}
-output "account_id" {
-    value = data.aws_caller_identity.current.account_id
+  }
+}
+
+provider "aws" {
+  region = "us-east-2"
+
+  # 给所有资源自动加上标签，方便在控制台里找到、统计费用
+  default_tags {
+    tags = {
+      Project = "wordchain"
     }
+  }
+}
