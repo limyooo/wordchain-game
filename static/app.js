@@ -7,10 +7,31 @@ const GRACE_MS = 2500; // 倒计时到 0 后等一会儿再通知后端（后端
 const RING_CIRCUMFERENCE = 2 * Math.PI * 19; // 圆环周长，和 SVG 里的 r="19" 对应
 
 /* =========================================================
+ * 玩家 ID：第一次打开时随机生成，存在浏览器里，关掉浏览器也还在
+ * ========================================================= */
+const PLAYER_KEY = "wordchain_player_id";
+
+function getPlayerId() {
+  try {
+    let id = localStorage.getItem(PLAYER_KEY);
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem(PLAYER_KEY, id);
+    }
+    return id;
+  } catch {
+    // 无痕模式等情况下 localStorage 用不了：这次访问内有效，关掉就没了
+    getPlayerId.fallback ??= crypto.randomUUID();
+    return getPlayerId.fallback;
+  }
+}
+const PLAYER_ID = getPlayerId();
+
+/* =========================================================
  * API 层
  * ========================================================= */
 const api = {
-  // GET /api/sessions -> [{id, name, created_at}]
+  // GET /api/sessions -> [{id, name, created_at}]（只有自己的）
   listSessions: () => request("GET", "/api/sessions"),
 
   // POST /api/sessions  body: {rounds, seconds}
@@ -29,12 +50,23 @@ const api = {
 };
 
 async function request(method, path, body) {
+  const headers = { "X-Player-Id": PLAYER_ID }; // 每个请求都带上玩家 ID
+  if (body) headers["Content-Type"] = "application/json";
+
   const res = await fetch(API_BASE + path, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : {},
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
-  if (!res.ok) throw new Error(`${method} ${path} failed: HTTP ${res.status}`);
+  if (!res.ok) {
+    // 优先显示后端返回的提示，比如 "Game not found. It may have expired."
+    let msg = `Request failed (HTTP ${res.status})`;
+    try {
+      const data = await res.json();
+      if (data.detail) msg = data.detail;
+    } catch { /* 返回的不是 JSON，就用默认提示 */ }
+    throw new Error(msg);
+  }
   return res.json();
 }
 
@@ -64,7 +96,7 @@ function toast(text) {
   els.toast.textContent = text;
   els.toast.style.display = "block";
   clearTimeout(toast.t);
-  toast.t = setTimeout(() => (els.toast.style.display = "none"), 2500);
+  toast.t = setTimeout(() => (els.toast.style.display = "none"), 3500);
 }
 
 /* =========================================================
@@ -285,7 +317,15 @@ async function openSession(id) {
     // 旧游戏不知道还剩多少时间，等发送下一个词时由后端判定
     state.status = "playing";
     setInputEnabled(true);
-  } catch (e) { toast(e.message); }
+  } catch (e) {
+    toast(e.message);
+    // 存档已经不在了（比如 Lambda 上 /tmp 被清空）：从列表里移除
+    if (e.message.startsWith("Game not found")) {
+      state.sessions = state.sessions.filter((x) => x.id !== id);
+      state.currentId = null;
+      renderSessions();
+    }
+  }
 }
 
 async function removeSession(id) {
