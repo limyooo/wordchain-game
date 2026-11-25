@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.responses import FileResponse
 
+from mangum import Mangum
 app = FastAPI(title="wordchain")
 
 
@@ -46,13 +47,16 @@ class ChatRequest(BaseModel):
 class ChatReply(BaseModel):
     reply: str
 
-
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 存放会话的目录（相对 main.py，而不是相对启动时的 cwd）
-SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+
+# Lambda 上只有 /tmp 可以写文件；本地还是用项目里的 sessions 文件夹
+ON_LAMBDA = "AWS_LAMBDA_FUNCTION_NAME" in os.environ
+if ON_LAMBDA:
+    SESSIONS_DIR = "/tmp/sessions"
+else:
+    SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 # 英文词典：启动时读一次，放进 set 里，查询很快
@@ -234,3 +238,5 @@ def chat(sid: str, req: ChatRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Lambda 的入口：Mangum 把 Lambda 的请求翻译成 FastAPI 能懂的格式
+    handler = Mangum(app)
