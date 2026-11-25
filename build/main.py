@@ -32,6 +32,7 @@ app = FastAPI(title="wordchain")
 DEFAULT_TURN_LIMIT = 10  # 每回合限时（秒）
 DEFAULT_WIN_ROUNDS = 10  # 撑过这么多轮就赢
 GRACE_SECONDS = 2        # 给网络延迟留一点余量
+SESSION_TTL_DAYS = 30    # 游戏记录保留多少天（只对 DynamoDB 生效）
 
 
 # ---------- 数据模型 ----------
@@ -55,7 +56,7 @@ class Session(SessionInfo):
 
 
 class GameSession(Session):
-    """存进文件的完整数据：比返回给前端的 Session 多了游戏状态"""
+    """存储的完整数据：比返回给前端的 Session 多了游戏状态"""
     owner: str              # 这局属于哪个玩家
     used_words: list[str]
     status: str             # "playing" / "won" / "lost"
@@ -105,7 +106,6 @@ async def log_requests(request: Request, call_next):
     try:
         response = await call_next(request)
     except Exception:
-        # 没有被任何地方处理的错误：记录完整堆栈，返回友好的提示
         ms = (time.perf_counter() - start) * 1000
         logger.exception("Unhandled error on %s %s (%.0f ms)", request.method, request.url.path, ms)
         return JSONResponse(status_code=500,
@@ -137,16 +137,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
-# Lambda 上只有 /tmp 可以写文件；本地还是用项目里的 sessions 文件夹
-ON_LAMBDA = "AWS_LAMBDA_FUNCTION_NAME" in os.environ
-if ON_LAMBDA:
-    SESSIONS_DIR = "/tmp/sessions"
-else:
-    SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
-os.makedirs(SESSIONS_DIR, exist_ok=True)
-
 # 英文词典：启动时读一次，放进 set 里，查询很快
-# 如果还没下载 words.txt，就先跳过“是不是真单词”的检查
 WORDS_PATH = os.path.join(BASE_DIR, "words.txt")
 if os.path.exists(WORDS_PATH):
     with open(WORDS_PATH, encoding="utf-8") as f:
@@ -158,24 +149,69 @@ else:
 
 
 # ---------- 存储 ----------
+# 云上：Lambda 有 TABLE_NAME 环境变量，用 DynamoDB
+# 本地：没有 TABLE_NAME，用项目里的 sessions 文件夹
+TABLE_NAME = os.environ.get("TABLE_NAME")
+PLAYER_INDEX = "player-created-index"
+
+if TABLE_NAME:
+    import boto3  # Lambda 自带 boto3，本地不需要安装
+    from boto3.dynamodb.conditions import Key
+
+    table = boto3.resource("dynamodb").Table(TABLE_NAME)
+    logger.info("Storage: DynamoDB table %s", TABLE_NAME)
+else:
+    SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    logger.info("Storage: local files in %s", SESSIONS_DIR)
+
+
 def session_path(sid: str) -> str:
+    """本地文件存储：会话文件的路径"""
     return os.path.join(SESSIONS_DIR, f"{sid}.json")
 
 
 def save_session(data: dict) -> None:
+    if TABLE_NAME:
+        try:
+            table.put_item(Item={
+                "id": data["id"],
+                "player_id": data["owner"],        # 给索引用：按玩家查找
+                "created_at": data["created_at"],  # 给索引用：按时间排序
+                "name": data["name"],              # 列表里显示的名字
+                "expires_at": int(time.time()) + SESSION_TTL_DAYS * 86400,  # 30 天后自动删除
+                "data": json.dumps(data, ensure_ascii=False),  # 整局游戏存成一段文字
+            })
+        except Exception:
+            logger.exception("DynamoDB put_item failed for session %s", data["id"][:8])
+            raise HTTPException(status_code=500, detail="Could not save the game. Please try again.")
+        return
+
     try:
         with open(session_path(data["id"]), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except OSError:
-        logger.exception("Failed to save session %s", data.get("id"))
+        logger.exception("Failed to save session %s", data["id"][:8])
         raise HTTPException(status_code=500, detail="Could not save the game. Please try again.")
 
 
 def load_session(sid: str) -> dict:
+    not_found = HTTPException(status_code=404, detail="Game not found. It may have expired.")
+
+    if TABLE_NAME:
+        try:
+            item = table.get_item(Key={"id": sid}).get("Item")
+        except Exception:
+            logger.exception("DynamoDB get_item failed for session %s", sid[:8])
+            raise HTTPException(status_code=500, detail="Could not load the game. Please try again.")
+        if not item:
+            raise not_found
+        return json.loads(item["data"])  # 把文字还原成整局游戏
+
     path = session_path(sid)
     # 防止 id 里带 ../ 之类读到目录外的文件
     if os.path.dirname(os.path.abspath(path)) != SESSIONS_DIR or not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Game not found. It may have expired.")
+        raise not_found
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
@@ -184,11 +220,51 @@ def load_session(sid: str) -> dict:
         raise HTTPException(status_code=500, detail="This game's save file is damaged. Please start a new game.")
 
 
+def delete_session_data(sid: str) -> None:
+    if TABLE_NAME:
+        try:
+            table.delete_item(Key={"id": sid})
+        except Exception:
+            logger.exception("DynamoDB delete_item failed for session %s", sid[:8])
+            raise HTTPException(status_code=500, detail="Could not delete the game. Please try again.")
+        return
+    os.remove(session_path(sid))
+
+
+def list_player_sessions(player_id: str) -> list[dict]:
+    """列出某个玩家的游戏，最新的在前"""
+    if TABLE_NAME:
+        try:
+            resp = table.query(
+                IndexName=PLAYER_INDEX,
+                KeyConditionExpression=Key("player_id").eq(player_id),  # 只要这个玩家的
+                ScanIndexForward=False,  # 按 created_at 倒序，最新的在前
+                Limit=50,                # 最多显示 50 局
+            )
+        except Exception:
+            logger.exception("DynamoDB query failed for player %s", short(player_id))
+            raise HTTPException(status_code=500, detail="Could not load your games. Please try again.")
+        return [{"id": i["id"], "name": i["name"], "created_at": i["created_at"]} for i in resp["Items"]]
+
+    sessions = []
+    for filename in os.listdir(SESSIONS_DIR):
+        if not filename.endswith(".json"):
+            continue
+        try:
+            data = load_session(filename[:-5])
+        except HTTPException:
+            continue  # 损坏的存档跳过，不影响其他存档显示
+        if data.get("owner") == player_id:
+            sessions.append({"id": data["id"], "name": data["name"], "created_at": data["created_at"]})
+    sessions.sort(key=lambda s: s["created_at"], reverse=True)
+    return sessions
+
+
 def load_owned_session(sid: str, player_id: str) -> dict:
     """读取会话，并确认它属于这个玩家。不属于就当作不存在（返回 404），不暴露别人的游戏。"""
     data = load_session(sid)
     if data.get("owner") != player_id:
-        logger.warning("Player %s tried to access game %s owned by someone else", short(player_id), sid)
+        logger.warning("Player %s tried to access game %s owned by someone else", short(player_id), sid[:8])
         raise HTTPException(status_code=404, detail="Game not found. It may have expired.")
     return data
 
@@ -296,18 +372,7 @@ def root():
 # 会话列表：只返回自己的游戏，最新的在前
 @app.get("/api/sessions", response_model=list[SessionInfo])
 def list_sessions(player_id: str = Depends(get_player_id)):
-    sessions = []
-    for filename in os.listdir(SESSIONS_DIR):
-        if filename.endswith(".json"):
-            try:
-                data = load_session(filename[:-5])
-            except HTTPException:
-                continue  # 损坏的存档跳过，不影响其他存档显示
-            if data.get("owner") != player_id:
-                continue  # 别人的游戏不显示
-            sessions.append({"id": data["id"], "name": data["name"], "created_at": data["created_at"]})
-    sessions.sort(key=lambda s: s["created_at"], reverse=True)
-    return sessions
+    return list_player_sessions(player_id)
 
 
 # 新建会话：可以带上玩家的设置，不带就用默认值
@@ -348,7 +413,7 @@ def create_session(req: NewGameRequest | None = None, player_id: str = Depends(g
 @app.delete("/api/sessions/{sid}", response_model=OkResponse)
 def delete_session(sid: str, player_id: str = Depends(get_player_id)):
     load_owned_session(sid, player_id)  # 不存在或不是自己的，返回 404
-    os.remove(session_path(sid))
+    delete_session_data(sid)
     logger.info("Game %s deleted by player %s", sid[:8], short(player_id))
     return {"ok": True}
 
