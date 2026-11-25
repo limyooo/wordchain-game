@@ -20,7 +20,7 @@ resource "aws_iam_role_policy_attachment" "lambda_logs" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# 权限 2：只能读取我们那一个 secret（最小权限原则）
+# 权限 2：只能读取我们那一个 secret
 data "aws_iam_policy_document" "read_secret" {
   statement {
     actions   = ["secretsmanager:GetSecretValue"]
@@ -32,6 +32,29 @@ resource "aws_iam_role_policy" "read_secret" {
   name   = "read-anthropic-secret"
   role   = aws_iam_role.lambda.id
   policy = data.aws_iam_policy_document.read_secret.json
+}
+
+# 权限 3：只能读写我们的两张表（和它们的索引），而且只开放用到的操作
+data "aws_iam_policy_document" "dynamodb" {
+  statement {
+    actions = [
+      "dynamodb:GetItem",    # 按 ID 读取
+      "dynamodb:PutItem",    # 保存
+      "dynamodb:DeleteItem", # 删除
+      "dynamodb:Query",      # 用索引查找
+    ]
+    resources = [
+      aws_dynamodb_table.sessions.arn,
+      "${aws_dynamodb_table.sessions.arn}/index/*",
+      aws_dynamodb_table.rooms.arn,
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "dynamodb" {
+  name   = "wordchain-dynamodb"
+  role   = aws_iam_role.lambda.id
+  policy = data.aws_iam_policy_document.dynamodb.json
 }
 
 # ---------- 日志 ----------
@@ -57,29 +80,9 @@ resource "aws_lambda_function" "app" {
     variables = {
       ANTHROPIC_SECRET_ARN = aws_secretsmanager_secret.anthropic.arn
       TABLE_NAME           = aws_dynamodb_table.sessions.name
+      ROOMS_TABLE_NAME     = aws_dynamodb_table.rooms.name
     }
   }
 
   depends_on = [aws_cloudwatch_log_group.lambda, aws_iam_role_policy_attachment.lambda_logs]
-}
-# 权限 3：只能读写我们那一张表（和它的索引），而且只开放用到的 4 个操作
-data "aws_iam_policy_document" "dynamodb" {
-  statement {
-    actions = [
-      "dynamodb:GetItem",    # 按 ID 读取一局
-      "dynamodb:PutItem",    # 保存一局
-      "dynamodb:DeleteItem", # 删除一局
-      "dynamodb:Query",      # 用索引查找某个玩家的所有游戏
-    ]
-    resources = [
-      aws_dynamodb_table.sessions.arn,
-      "${aws_dynamodb_table.sessions.arn}/index/*",
-    ]
-  }
-}
-
-resource "aws_iam_role_policy" "dynamodb" {
-  name   = "wordchain-dynamodb"
-  role   = aws_iam_role.lambda.id
-  policy = data.aws_iam_policy_document.dynamodb.json
 }

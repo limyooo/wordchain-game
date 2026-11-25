@@ -2,9 +2,11 @@ import json
 import logging
 import os
 import random
+import secrets
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import Decimal
 
 import anthropic
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -28,11 +30,23 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 app = FastAPI(title="wordchain")
 
-# ---------- 游戏设置（默认值，玩家可以在新建游戏时修改） ----------
+# ---------- 游戏设置 ----------
 DEFAULT_TURN_LIMIT = 10  # 每回合限时（秒）
 DEFAULT_WIN_ROUNDS = 10  # 撑过这么多轮就赢
 GRACE_SECONDS = 2        # 给网络延迟留一点余量
 SESSION_TTL_DAYS = 30    # 游戏记录保留多少天（只对 DynamoDB 生效）
+
+# ---------- 房间设置 ----------
+ROOM_TTL_SECONDS = 24 * 3600                     # 房间保留 1 天
+ROOM_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # 去掉了容易看错的 0 O 1 I L
+ROOM_CODE_LENGTH = 4
+# 用来“算出”房间游戏 ID 的命名空间：同一个人在同一个房间，算出来的 ID 永远一样
+ROOM_GAME_NAMESPACE = uuid.UUID("6f1c2b8e-3d4a-4f5b-9c7d-1e2f3a4b5c6d")
+
+
+def utc_now_iso() -> str:
+    """带时区的 UTC 时间，前端会转换成玩家的本地时间显示"""
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------- 数据模型 ----------
@@ -49,19 +63,12 @@ class SessionInfo(BaseModel):
 
 
 class Session(SessionInfo):
-    """新建会话时返回：多了 messages 和这一局的设置"""
+    """新建/加入游戏时返回"""
     messages: list[Message]
     turn_limit: int = DEFAULT_TURN_LIMIT
     win_rounds: int = DEFAULT_WIN_ROUNDS
-
-
-class GameSession(Session):
-    """存储的完整数据：比返回给前端的 Session 多了游戏状态"""
-    owner: str              # 这局属于哪个玩家
-    used_words: list[str]
-    status: str             # "playing" / "won" / "lost"
-    rounds: int             # 玩家成功接上的词数
-    turn_started_at: float  # 这一回合开始的时间（秒）
+    status: str = "playing"        # "waiting" / "playing" / "won" / "lost"
+    room_code: str | None = None   # 单人游戏没有房间码
 
 
 class OkResponse(BaseModel):
@@ -69,9 +76,13 @@ class OkResponse(BaseModel):
 
 
 class NewGameRequest(BaseModel):
-    """新建游戏时玩家的设置，Field 会自动检查范围"""
+    """新建单人游戏 / 创建房间时的设置，Field 会自动检查范围"""
     rounds: int = Field(DEFAULT_WIN_ROUNDS, ge=3, le=50)
     seconds: int = Field(DEFAULT_TURN_LIMIT, ge=5, le=60)
+
+
+class JoinRoomRequest(BaseModel):
+    nickname: str = Field(..., min_length=1, max_length=20)
 
 
 class ChatRequest(BaseModel):
@@ -80,9 +91,45 @@ class ChatRequest(BaseModel):
 
 class ChatReply(BaseModel):
     reply: str
-    status: str   # "playing" / "won" / "lost"，前端用来决定要不要继续倒计时
+    status: str   # "waiting" / "playing" / "won" / "lost"
     rounds: int
     turn_limit: int
+
+
+class GameState(BaseModel):
+    """一局游戏现在的状态，前端用它来恢复倒计时"""
+    status: str
+    rounds: int
+    win_rounds: int
+    turn_limit: int
+    seconds_left: float | None  # 这一回合还剩几秒；没在玩就是 None
+    room_code: str | None
+
+
+class RoomInfo(BaseModel):
+    code: str
+    status: str                 # "waiting" / "playing" / "finished"
+    rounds: int
+    seconds: int
+    is_host: bool               # 我是不是房主
+    players: list[str]          # 已加入的昵称
+    my_game_id: str | None      # 我在这个房间的游戏 ID（还没加入就是 None）
+
+
+class LeaderboardRow(BaseModel):
+    rank: int
+    nickname: str
+    status: str
+    rounds: int
+    late: bool
+    seconds_used: float | None  # 从自己开始算起用了多久；还没开始就是 None
+
+
+class Leaderboard(BaseModel):
+    code: str
+    status: str
+    win_rounds: int
+    rows: list[LeaderboardRow]
 
 
 # ---------- 玩家身份 ----------
@@ -149,21 +196,39 @@ else:
 
 
 # ---------- 存储 ----------
-# 云上：Lambda 有 TABLE_NAME 环境变量，用 DynamoDB
-# 本地：没有 TABLE_NAME，用项目里的 sessions 文件夹
+# 云上：Lambda 有 TABLE_NAME / ROOMS_TABLE_NAME 环境变量，用 DynamoDB
+# 本地：没有这两个变量，用项目里的 sessions / rooms 文件夹
 TABLE_NAME = os.environ.get("TABLE_NAME")
+ROOMS_TABLE_NAME = os.environ.get("ROOMS_TABLE_NAME")
 PLAYER_INDEX = "player-created-index"
+ROOM_INDEX = "room-created-index"
 
 if TABLE_NAME:
     import boto3  # Lambda 自带 boto3，本地不需要安装
     from boto3.dynamodb.conditions import Key
 
-    table = boto3.resource("dynamodb").Table(TABLE_NAME)
-    logger.info("Storage: DynamoDB table %s", TABLE_NAME)
+    dynamodb = boto3.resource("dynamodb")
+    table = dynamodb.Table(TABLE_NAME)
+    rooms_table = dynamodb.Table(ROOMS_TABLE_NAME) if ROOMS_TABLE_NAME else None
+    logger.info("Storage: DynamoDB tables %s, %s", TABLE_NAME, ROOMS_TABLE_NAME)
 else:
     SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
+    ROOMS_DIR = os.path.join(BASE_DIR, "rooms")
     os.makedirs(SESSIONS_DIR, exist_ok=True)
-    logger.info("Storage: local files in %s", SESSIONS_DIR)
+    os.makedirs(ROOMS_DIR, exist_ok=True)
+    logger.info("Storage: local files in %s and %s", SESSIONS_DIR, ROOMS_DIR)
+
+
+def plain(value):
+    """DynamoDB 读出来的数字是 Decimal，转回 Python 的 int 或 float"""
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    return value
+
+
+def to_dynamo(value):
+    """DynamoDB 不接受 Python 的 float，要转成 Decimal"""
+    return Decimal(str(value)) if isinstance(value, float) else value
 
 
 def session_path(sid: str) -> str:
@@ -173,15 +238,23 @@ def session_path(sid: str) -> str:
 
 def save_session(data: dict) -> None:
     if TABLE_NAME:
+        item = {
+            "id": data["id"],
+            "player_id": data["owner"],        # 给索引 1 用：按玩家查找
+            "created_at": data["created_at"],  # 两个索引都用它排序
+            "name": data["name"],
+            "status": data.get("status", "playing"),
+            "rounds": data.get("rounds", 0),
+            "late": bool(data.get("late", False)),
+            "expires_at": int(time.time()) + SESSION_TTL_DAYS * 86400,
+            "data": json.dumps(data, ensure_ascii=False),  # 整局游戏存成一段文字
+        }
+        # 只有房间游戏才有这些字段；没有 room_code 就不会进索引 2（稀疏索引）
+        for key in ("room_code", "nickname", "started_at", "finished_at"):
+            if data.get(key) is not None:
+                item[key] = to_dynamo(data[key])
         try:
-            table.put_item(Item={
-                "id": data["id"],
-                "player_id": data["owner"],        # 给索引用：按玩家查找
-                "created_at": data["created_at"],  # 给索引用：按时间排序
-                "name": data["name"],              # 列表里显示的名字
-                "expires_at": int(time.time()) + SESSION_TTL_DAYS * 86400,  # 30 天后自动删除
-                "data": json.dumps(data, ensure_ascii=False),  # 整局游戏存成一段文字
-            })
+            table.put_item(Item=item)
         except Exception:
             logger.exception("DynamoDB put_item failed for session %s", data["id"][:8])
             raise HTTPException(status_code=500, detail="Could not save the game. Please try again.")
@@ -237,9 +310,9 @@ def list_player_sessions(player_id: str) -> list[dict]:
         try:
             resp = table.query(
                 IndexName=PLAYER_INDEX,
-                KeyConditionExpression=Key("player_id").eq(player_id),  # 只要这个玩家的
+                KeyConditionExpression=Key("player_id").eq(player_id),
                 ScanIndexForward=False,  # 按 created_at 倒序，最新的在前
-                Limit=50,                # 最多显示 50 局
+                Limit=50,
             )
         except Exception:
             logger.exception("DynamoDB query failed for player %s", short(player_id))
@@ -253,7 +326,7 @@ def list_player_sessions(player_id: str) -> list[dict]:
         try:
             data = load_session(filename[:-5])
         except HTTPException:
-            continue  # 损坏的存档跳过，不影响其他存档显示
+            continue  # 损坏的存档跳过
         if data.get("owner") == player_id:
             sessions.append({"id": data["id"], "name": data["name"], "created_at": data["created_at"]})
     sessions.sort(key=lambda s: s["created_at"], reverse=True)
@@ -267,6 +340,137 @@ def load_owned_session(sid: str, player_id: str) -> dict:
         logger.warning("Player %s tried to access game %s owned by someone else", short(player_id), sid[:8])
         raise HTTPException(status_code=404, detail="Game not found. It may have expired.")
     return data
+
+
+# ---------- 房间存储 ----------
+def room_path(code: str) -> str:
+    return os.path.join(ROOMS_DIR, f"{code}.json")
+
+
+def save_room(room: dict, new: bool = False) -> bool:
+    """保存房间。new=True 时，如果房间码已经存在就不覆盖，返回 False。"""
+    if TABLE_NAME:
+        item = {k: to_dynamo(v) for k, v in room.items() if v is not None}
+        kwargs = {"Item": item}
+        if new:
+            # 条件写入：只有这个房间码还不存在时才写，防止两个房间撞码
+            kwargs["ConditionExpression"] = "attribute_not_exists(code)"
+        try:
+            rooms_table.put_item(**kwargs)
+            return True
+        except rooms_table.meta.client.exceptions.ConditionalCheckFailedException:
+            return False
+        except Exception:
+            logger.exception("DynamoDB put_item failed for room %s", room["code"])
+            raise HTTPException(status_code=500, detail="Could not save the room. Please try again.")
+
+    path = room_path(room["code"])
+    if new and os.path.exists(path):
+        return False
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(room, f, ensure_ascii=False, indent=2)
+    return True
+
+
+def normalize_code(code: str) -> str:
+    """房间码不区分大小写，去掉空格；格式不对直接当作不存在"""
+    code = code.strip().upper()
+    if len(code) != ROOM_CODE_LENGTH or any(c not in ROOM_CODE_ALPHABET for c in code):
+        raise HTTPException(status_code=404, detail="Room not found. Check the code and try again.")
+    return code
+
+
+def load_room(code: str) -> dict:
+    code = normalize_code(code)
+    not_found = HTTPException(status_code=404, detail="Room not found. Check the code and try again.")
+
+    if TABLE_NAME:
+        try:
+            item = rooms_table.get_item(Key={"code": code}).get("Item")
+        except Exception:
+            logger.exception("DynamoDB get_item failed for room %s", code)
+            raise HTTPException(status_code=500, detail="Could not load the room. Please try again.")
+        if not item:
+            raise not_found
+        return {k: plain(v) for k, v in item.items()}
+
+    path = room_path(code)
+    if not os.path.exists(path):
+        raise not_found
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def list_room_games(code: str) -> list[dict]:
+    """列出房间里所有人的游戏（只要排行榜需要的字段），按加入顺序"""
+    if TABLE_NAME:
+        items = []
+        kwargs = {"IndexName": ROOM_INDEX, "KeyConditionExpression": Key("room_code").eq(code)}
+        try:
+            while True:  # 结果太多时 DynamoDB 会分页，要一页一页读
+                resp = table.query(**kwargs)
+                items.extend(resp["Items"])
+                if "LastEvaluatedKey" not in resp or len(items) >= 200:
+                    break
+                kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        except Exception:
+            logger.exception("DynamoDB query failed for room %s", code)
+            raise HTTPException(status_code=500, detail="Could not load the room. Please try again.")
+        return [{
+            "id": i["id"],
+            "nickname": i.get("nickname", ""),
+            "status": i.get("status", "playing"),
+            "rounds": plain(i.get("rounds", 0)),
+            "late": bool(i.get("late", False)),
+            "started_at": plain(i.get("started_at")),
+            "finished_at": plain(i.get("finished_at")),
+        } for i in items]
+
+    games = []
+    for filename in os.listdir(SESSIONS_DIR):
+        if not filename.endswith(".json"):
+            continue
+        try:
+            data = load_session(filename[:-5])
+        except HTTPException:
+            continue
+        if data.get("room_code") == code:
+            games.append({
+                "id": data["id"],
+                "nickname": data.get("nickname", ""),
+                "status": data.get("status", "playing"),
+                "rounds": data.get("rounds", 0),
+                "late": data.get("late", False),
+                "started_at": data.get("started_at"),
+                "finished_at": data.get("finished_at"),
+                "created_at": data["created_at"],
+            })
+    games.sort(key=lambda g: g["created_at"])
+    return games
+
+
+def room_game_id(code: str, player_id: str) -> str:
+    """同一个人在同一个房间，算出来的游戏 ID 永远一样，所以每人只能有一局"""
+    return uuid.uuid5(ROOM_GAME_NAMESPACE, f"{code}:{player_id}").hex
+
+
+def room_info(room: dict, player_id: str) -> dict:
+    games = list_room_games(room["code"])
+    my_id = room_game_id(room["code"], player_id)
+    return {
+        "code": room["code"],
+        "status": room["status"],
+        "rounds": room["rounds"],
+        "seconds": room["seconds"],
+        "is_host": room["host_id"] == player_id,
+        "players": [g["nickname"] for g in games],
+        "my_game_id": my_id if any(g["id"] == my_id for g in games) else None,
+    }
+
+
+def require_host(room: dict, player_id: str) -> None:
+    if room["host_id"] != player_id:
+        raise HTTPException(status_code=403, detail="Only the host can do this.")
 
 
 # ---------- 游戏规则 ----------
@@ -285,6 +489,41 @@ def check_word(word: str, used_words: list[str]) -> str | None:
     if word in used_words:
         return f"'{word}' was already used. Try another word!"
     return None
+
+
+def start_message(first_word: str, seconds: int, rounds: int) -> dict:
+    return {
+        "role": "assistant",
+        "content": f"Let's play! My word is '{first_word}'. "
+                   f"Your turn: give me a word starting with '{first_word[-1]}'. "
+                   f"You have {seconds} seconds per turn. "
+                   f"Survive {rounds} rounds to win!",
+    }
+
+
+def fill_defaults(data: dict) -> None:
+    """旧存档没有这些字段，给默认值"""
+    data.setdefault("status", "playing")
+    data.setdefault("rounds", 0)
+    data.setdefault("turn_started_at", time.time())
+    data.setdefault("turn_limit", DEFAULT_TURN_LIMIT)
+    data.setdefault("win_rounds", DEFAULT_WIN_ROUNDS)
+
+
+def activate_if_room_started(data: dict) -> None:
+    """懒更新：房间游戏还在等待，但房主已经点了 Start，就在这里把这局切换成进行中"""
+    if data.get("status") != "waiting" or not data.get("room_code"):
+        return
+    room = load_room(data["room_code"])
+    if room["status"] == "waiting":
+        return
+    start = room.get("started_at") or time.time()
+    data["status"] = "playing"
+    data["started_at"] = start
+    data["turn_started_at"] = start  # 第一回合从房主点 Start 的那一刻算起
+    data["messages"].append(start_message(data["used_words"][0], data["turn_limit"], data["win_rounds"]))
+    save_session(data)
+    logger.info("Room game %s activated in room %s", data["id"][:8], data["room_code"])
 
 
 # ---------- AI ----------
@@ -363,45 +602,40 @@ def ai_next_word(used_words: list[str]) -> str | None:
     return None
 
 
-# ---------- 接口 ----------
+# ---------- 接口：页面 ----------
 @app.get("/")
 def root():
     return FileResponse(os.path.join(BASE_DIR, "static", "index.html"))
 
 
+# ---------- 接口：单人游戏 ----------
 # 会话列表：只返回自己的游戏，最新的在前
 @app.get("/api/sessions", response_model=list[SessionInfo])
 def list_sessions(player_id: str = Depends(get_player_id)):
     return list_player_sessions(player_id)
 
 
-# 新建会话：可以带上玩家的设置，不带就用默认值
+# 新建单人游戏：可以带上玩家的设置，不带就用默认值
 @app.post("/api/sessions", response_model=Session)
 def create_session(req: NewGameRequest | None = None, player_id: str = Depends(get_player_id)):
     settings = req or NewGameRequest()
-    now = datetime.now()
     sid = uuid.uuid4().hex  # 随机 ID，别人猜不到
-
-    first_word = random.choice(START_WORDS)  # 每局随机一个开局词
+    first_word = random.choice(START_WORDS)
+    now = time.time()
 
     data = {
         "id": sid,
-        "name": now.strftime("%Y-%m-%d %H:%M:%S"),  # 列表里显示的名字
-        "created_at": now.isoformat(),
+        "name": "Solo game",
+        "created_at": utc_now_iso(),
         "owner": player_id,
         "used_words": [first_word],  # 本局用过的词，最后一个就是“上一个词”
         "status": "playing",
         "rounds": 0,
         "turn_limit": settings.seconds,
         "win_rounds": settings.rounds,
-        "turn_started_at": time.time(),  # 第一回合从现在开始计时
-        "messages": [{
-            "role": "assistant",
-            "content": f"Let's play! My word is '{first_word}'. "
-                       f"Your turn: give me a word starting with '{first_word[-1]}'. "
-                       f"You have {settings.seconds} seconds per turn. "
-                       f"Survive {settings.rounds} rounds to win!",
-        }],
+        "started_at": now,
+        "turn_started_at": now,  # 第一回合从现在开始计时
+        "messages": [start_message(first_word, settings.seconds, settings.rounds)],
     }
     save_session(data)
     logger.info("Game %s created by player %s: first word '%s', %d rounds, %ds per turn",
@@ -421,29 +655,53 @@ def delete_session(sid: str, player_id: str = Depends(get_player_id)):
 # 获取某个会话的消息：只能看自己的
 @app.get("/api/sessions/{sid}/messages", response_model=list[Message])
 def get_messages(sid: str, player_id: str = Depends(get_player_id)):
-    return load_owned_session(sid, player_id)["messages"]
+    data = load_owned_session(sid, player_id)
+    activate_if_room_started(data)
+    return data["messages"]
 
 
-# 聊天：玩家出一个词，AI 接下一个
+# 一局游戏现在的状态：前端用来恢复倒计时，也用来在大厅里等待开始
+@app.get("/api/sessions/{sid}/state", response_model=GameState)
+def game_state(sid: str, player_id: str = Depends(get_player_id)):
+    data = load_owned_session(sid, player_id)
+    fill_defaults(data)
+    activate_if_room_started(data)
+    seconds_left = None
+    if data["status"] == "playing":
+        seconds_left = max(0.0, data["turn_limit"] - (time.time() - data["turn_started_at"]))
+    return {
+        "status": data["status"],
+        "rounds": data["rounds"],
+        "win_rounds": data["win_rounds"],
+        "turn_limit": data["turn_limit"],
+        "seconds_left": seconds_left,
+        "room_code": data.get("room_code"),
+    }
+
+
+# 聊天：玩家出一个词，AI 接下一个（单人和房间游戏共用）
 @app.post("/api/sessions/{sid}/chat", response_model=ChatReply)
 def chat(sid: str, req: ChatRequest, player_id: str = Depends(get_player_id)):
     data = load_owned_session(sid, player_id)
-    # 旧存档没有这些字段，给默认值
-    data.setdefault("status", "playing")
-    data.setdefault("rounds", 0)
-    data.setdefault("turn_started_at", time.time())
-    data.setdefault("turn_limit", DEFAULT_TURN_LIMIT)
-    data.setdefault("win_rounds", DEFAULT_WIN_ROUNDS)
+    fill_defaults(data)
+    activate_if_room_started(data)
     turn_limit = data["turn_limit"]
     win_rounds = data["win_rounds"]
     gid = sid[:8]  # 日志里用短 ID
 
     def result(reply: str) -> dict:
         """记下 AI 的回复、保存、返回给前端"""
+        if data["status"] in ("won", "lost") and not data.get("finished_at"):
+            data["finished_at"] = time.time()  # 排行榜用：什么时候结束的
         data["messages"].append({"role": "assistant", "content": reply})
         save_session(data)
         return {"reply": reply, "status": data["status"],
                 "rounds": data["rounds"], "turn_limit": turn_limit}
+
+    # 0. 房间还没开始：不接受单词
+    if data["status"] == "waiting":
+        return {"reply": "The game hasn't started yet. Waiting for the host...",
+                "status": "waiting", "rounds": 0, "turn_limit": turn_limit}
 
     # 1. 游戏已经结束：不再接受新的词
     if data["status"] != "playing":
@@ -491,6 +749,149 @@ def chat(sid: str, req: ChatRequest, player_id: str = Depends(get_player_id)):
     data["turn_started_at"] = time.time()  # AI 说完话，新回合开始计时
     return result(f"Nice! ({data['rounds']}/{win_rounds}) My word is '{ai_word}'. "
                   f"Your turn: a word starting with '{ai_word[-1]}'.")
+
+
+# ---------- 接口：房间 ----------
+# 创建房间：创建的人就是房主
+@app.post("/api/rooms", response_model=RoomInfo)
+def create_room(req: NewGameRequest | None = None, player_id: str = Depends(get_player_id)):
+    settings = req or NewGameRequest()
+    for _ in range(10):  # 万一随机到已经存在的房间码，就再换一个
+        code = "".join(secrets.choice(ROOM_CODE_ALPHABET) for _ in range(ROOM_CODE_LENGTH))
+        room = {
+            "code": code,
+            "host_id": player_id,
+            "status": "waiting",
+            "rounds": settings.rounds,
+            "seconds": settings.seconds,
+            "created_at": utc_now_iso(),
+            "expires_at": int(time.time()) + ROOM_TTL_SECONDS,
+        }
+        if save_room(room, new=True):
+            break
+    else:
+        raise HTTPException(status_code=503, detail="Could not create a room. Please try again.")
+
+    logger.info("Room %s created by player %s: %d rounds, %ds per turn",
+                code, short(player_id), settings.rounds, settings.seconds)
+    return room_info(room, player_id)
+
+
+# 查看房间：状态、已加入的人、我是不是房主
+@app.get("/api/rooms/{code}", response_model=RoomInfo)
+def get_room(code: str, player_id: str = Depends(get_player_id)):
+    return room_info(load_room(code), player_id)
+
+
+# 加入房间：只要房间还没结束就能加入；已经加入过就回到原来那局
+@app.post("/api/rooms/{code}/join", response_model=Session)
+def join_room(code: str, req: JoinRoomRequest, player_id: str = Depends(get_player_id)):
+    room = load_room(code)
+    code = room["code"]
+    gid = room_game_id(code, player_id)
+
+    # 已经加入过：直接返回原来那局（每人只能玩一局）
+    try:
+        existing = load_session(gid)
+        activate_if_room_started(existing)
+        logger.info("Player %s rejoined room %s", short(player_id), code)
+        return existing
+    except HTTPException as e:
+        if e.status_code != 404:
+            raise
+
+    if room["status"] == "finished":
+        raise HTTPException(status_code=409, detail="This room has ended.")
+
+    nickname = req.nickname.strip()
+    if not nickname:
+        raise HTTPException(status_code=422, detail="Please enter a nickname.")
+
+    first_word = random.choice(START_WORDS)  # 每人随机一个开局词
+    playing = room["status"] == "playing"    # 房间已经开始：迟到加入，马上开始
+    now = time.time()
+
+    data = {
+        "id": gid,
+        "name": f"Room {code} · {nickname}",
+        "created_at": utc_now_iso(),
+        "owner": player_id,
+        "room_code": code,
+        "nickname": nickname,
+        "late": playing,
+        "used_words": [first_word],
+        "status": "playing" if playing else "waiting",
+        "rounds": 0,
+        "turn_limit": room["seconds"],
+        "win_rounds": room["rounds"],
+        "started_at": now if playing else None,
+        "turn_started_at": now if playing else None,
+        "messages": [start_message(first_word, room["seconds"], room["rounds"])] if playing else [{
+            "role": "assistant",
+            "content": f"Welcome, {nickname}! You're in room {code}. "
+                       "Waiting for the host to start the game...",
+        }],
+    }
+    save_session(data)
+    logger.info("Player %s joined room %s as '%s'%s",
+                short(player_id), code, nickname, " (late)" if playing else "")
+    return data
+
+
+# 开始比赛：只有房主能调用
+@app.post("/api/rooms/{code}/start", response_model=RoomInfo)
+def start_room(code: str, player_id: str = Depends(get_player_id)):
+    room = load_room(code)
+    require_host(room, player_id)
+    if room["status"] == "waiting":
+        room["status"] = "playing"
+        room["started_at"] = time.time()  # 所有人的第一回合都从这一刻开始
+        save_room(room)
+        logger.info("Room %s started", room["code"])
+    return room_info(room, player_id)
+
+
+# 结束比赛：只有房主能调用，之后不能再加入
+@app.post("/api/rooms/{code}/end", response_model=RoomInfo)
+def end_room(code: str, player_id: str = Depends(get_player_id)):
+    room = load_room(code)
+    require_host(room, player_id)
+    if room["status"] != "finished":
+        room["status"] = "finished"
+        room["ended_at"] = time.time()
+        save_room(room)
+        logger.info("Room %s ended", room["code"])
+    return room_info(room, player_id)
+
+
+# 排行榜：不需要玩家 ID，投到大屏幕上的浏览器也能看
+@app.get("/api/rooms/{code}/leaderboard", response_model=Leaderboard)
+def leaderboard(code: str):
+    room = load_room(code)
+    now = time.time()
+    rows = []
+    for g in list_room_games(room["code"]):
+        status = g["status"]
+        started = g["started_at"]
+        # 房间已经开始，但这个人还没刷新到：当作从房间开始时算起
+        if status == "waiting" and room["status"] != "waiting":
+            status, started = "playing", room.get("started_at")
+        if started is None:
+            seconds_used = None
+        elif g["finished_at"]:
+            seconds_used = g["finished_at"] - started
+        else:
+            seconds_used = now - started
+        rows.append({"nickname": g["nickname"], "status": status, "rounds": g["rounds"],
+                     "late": g["late"], "seconds_used": seconds_used})
+
+    # 排名：赢了的在前 → 轮数多的在前 → 用时少的在前
+    rows.sort(key=lambda r: (r["status"] != "won", -r["rounds"],
+                             r["seconds_used"] if r["seconds_used"] is not None else float("inf")))
+    for i, r in enumerate(rows, start=1):
+        r["rank"] = i
+
+    return {"code": room["code"], "status": room["status"], "win_rounds": room["rounds"], "rows": rows}
 
 
 # Lambda 的入口：Mangum 把 Lambda 的请求翻译成 FastAPI 能懂的格式
