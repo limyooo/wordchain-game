@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>WordChain leaderboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏆</text></svg>" />
+<link rel="stylesheet" href="/static/style.css?v=10" />
+</head>
+<body class="board-page">
+<div class="board">
+  <header class="board-head">
+    <h1>🏆 WordChain leaderboard</h1>
+    <div class="board-meta">
+      <span class="board-room" id="boardRoom"></span>
+      <span class="pill" id="boardStatus"></span>
+    </div>
+  </header>
+
+  <!-- 网址里没有房间码时，先让用户输入 -->
+  <form class="board-form" id="codeForm" hidden>
+    <input id="codeInput" placeholder="CODE" maxlength="4" autocomplete="off" />
+    <button type="submit">Show</button>
+  </form>
+
+  <table class="board-table" id="boardTable" hidden>
+    <thead>
+      <tr><th>#</th><th>Player</th><th>Rounds</th><th>Status</th><th>Time</th></tr>
+    </thead>
+    <tbody id="boardBody"></tbody>
+  </table>
+  <p class="board-empty" id="boardEmpty" hidden>No players yet. Share the room code to join!</p>
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="/static/board.js?v=6"></script>
+</body>
+</html>

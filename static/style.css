@@ -107,6 +107,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .chat-header h2 { font-size: 18px; }
 .chat-header .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
 .messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+.messages > .msg:first-child { margin-top: auto; } /* 消息少的时候也从底部往上排，紧贴输入框 */
 .msg { display: flex; gap: 10px; align-items: flex-start; max-width: 75%; }
 .msg.user { align-self: flex-end; flex-direction: row-reverse; }
 .avatar {
@@ -300,12 +301,96 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
   .timer-ring.warn { animation: none; }
 }
 
+/* 电脑上不显示手机专用的按钮 */
+.btn-menu, .btn-close-menu { display: none; }
+.backdrop[hidden] { display: none; }
+.chat-title { min-width: 0; }
+
+/* ---------- 平板：隐藏右边的游戏介绍 ---------- */
 @media (max-width: 1000px) {
-  .app { grid-template-columns: 200px 1fr; }
+  .app { grid-template-columns: 220px 1fr; }
   .intro { display: none; }
 }
-@media (max-width: 640px) {
-  .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
-  .sidebar { max-height: 260px; overflow-y: auto; border-right: none; border-bottom: 1px solid var(--border); }
-  .msg { max-width: 90%; }
+
+/* ---------- 手机 ---------- */
+@media (max-width: 700px) {
+  /* 整个页面不滚动，只有聊天区里面滚动，这样键盘弹出时页面不会被推上去 */
+  html, body { overflow: hidden; overscroll-behavior: none; }
+  /* 整个界面“钉”在可见区域里：高度和位置由 app.js 根据键盘的情况设置，没有的话用 dvh */
+  .app {
+    display: block;
+    position: fixed; left: 0; right: 0;
+    top: var(--app-top, 0px);
+    height: 100vh; height: var(--app-height, 100dvh);
+  }
+  .chat { height: 100%; }
+  .messages { overscroll-behavior: contain; }
+
+  /* 键盘弹出时：收起房间栏，顶部再紧凑一点，给聊天区多留空间 */
+  body.kb-open .room-bar { display: none; }
+  body.kb-open .chat-header { padding-top: 6px; padding-bottom: 6px; }
+  body.kb-open .chat-header .sub { display: none; }
+
+  /* 左边栏变成从左边滑出来的抽屉菜单 */
+  .sidebar {
+    position: fixed; top: 0; bottom: 0; left: 0; z-index: 15;
+    width: 82%; max-width: 300px;
+    overflow-y: auto;
+    padding-top: calc(18px + env(safe-area-inset-top, 0px));
+    padding-bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+    transform: translateX(-100%);
+    transition: transform .25s ease;
+  }
+  .sidebar.open { transform: translateX(0); }
+  .session-list { flex: none; overflow: visible; }
+  .backdrop { position: fixed; inset: 0; z-index: 14; background: rgba(0, 0, 0, .5); }
+  .btn-close-menu {
+    display: inline-block; margin-left: auto;
+    background: none; color: var(--muted); font-size: 18px; padding: 2px 6px;
+  }
+
+  /* 顶部：菜单按钮 + 标题 + 倒计时 */
+  .chat-header {
+    gap: 10px; padding: 10px 12px;
+    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+  }
+  .btn-menu {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 38px; height: 38px; flex-shrink: 0;
+    background: var(--panel-2); color: var(--text); border-radius: 8px; font-size: 18px;
+  }
+  .chat-title { flex: 1; }
+  .chat-header h2 { font-size: 16px; }
+  .chat-header .sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .game-status { gap: 8px; font-size: 13px; }
+  #progress { font-size: 12px; }
+  .timer-ring { width: 44px; height: 44px; }
+  .ring-num { font-size: 14px; }
+
+  /* 房间栏：放不下就换行 */
+  .room-bar { flex-wrap: wrap; gap: 6px 10px; padding: 8px 12px; }
+  .room-actions { margin-left: 0; width: 100%; justify-content: space-between; }
+
+  /* 大厅、排行榜、消息 */
+  .lobby, .results { margin: 10px 12px 0; padding: 12px; }
+  .results-table { font-size: 13px; }
+  .results-table th, .results-table td { padding: 6px 4px; }
+  .messages { padding: 14px 12px; gap: 12px; }
+  .msg { max-width: 92%; }
+
+  /* 输入框：16px 以上，iPhone 点输入框时才不会自动放大页面 */
+  .composer { padding: 10px 12px; padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px)); }
+  .input-wrap input, .room-box input, .settings input, .board-form input { font-size: 16px; }
+  .btn-send { width: 38px; height: 38px; }
+
+  /* 弹窗 */
+  .modal-box { padding: 18px; }
+
+  /* 排行榜页面 */
+  .board { padding: 20px 12px; padding-top: calc(20px + env(safe-area-inset-top, 0px)); }
+  .board-head h1 { font-size: 20px; }
+  .board-meta { font-size: 15px; }
+  .board-table { font-size: 15px; }
+  .board-table th, .board-table td { padding: 10px 6px; }
+  .rank { width: 32px; }
 }

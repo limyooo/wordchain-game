@@ -93,6 +93,7 @@ const els = {
   lobby: $("lobby"), lobbyText: $("lobbyText"), lobbyPlayers: $("lobbyPlayers"),
   results: $("results"), resultsBody: $("resultsBody"),
   modal: $("modal"), modalText: $("modalText"), modalOk: $("modalOk"), modalCancel: $("modalCancel"),
+  sidebar: $("sidebar"), backdrop: $("backdrop"), btnMenu: $("btnMenu"), btnCloseMenu: $("btnCloseMenu"),
 };
 const state = {
   sessions: [], currentId: null, sending: false,
@@ -114,6 +115,40 @@ function toast(text) {
   els.toast.style.display = "block";
   clearTimeout(toast.t);
   toast.t = setTimeout(() => (els.toast.style.display = "none"), 3500);
+}
+
+// 手机上的抽屉菜单：打开 / 关闭（电脑上菜单一直显示，这两个函数没有影响）
+function openMenu() {
+  els.sidebar.classList.add("open");
+  els.backdrop.hidden = false;
+}
+function closeMenu() {
+  els.sidebar.classList.remove("open");
+  els.backdrop.hidden = true;
+}
+
+// 手机键盘适配：键盘弹出时，把游戏界面的高度设成“键盘上方剩下的高度”，
+// 页面固定在顶部不被推上去，聊天区自动滚到最新的消息
+function scrollToLatest() {
+  els.messages.scrollTop = els.messages.scrollHeight;
+}
+
+function fitToViewport() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const root = document.documentElement.style;
+  // 高度：键盘上方剩下的可见高度
+  root.setProperty("--app-height", `${vv.height}px`);
+  // 位置：iPhone 键盘弹出时会把可见区域往下偏移，界面跟着偏移，正好贴在可见区域里
+  root.setProperty("--app-top", `${vv.offsetTop}px`);
+  // 可见区域明显变矮，说明键盘弹出来了
+  document.body.classList.toggle("kb-open", vv.height < window.innerHeight * 0.8);
+  scrollToLatest();
+}
+
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", fitToViewport);
+  window.visualViewport.addEventListener("scroll", fitToViewport);
 }
 
 // 页面内的确认弹窗：返回 Promise，点确定是 true，点取消是 false
@@ -510,6 +545,7 @@ async function newSession() {
   els.btnNew.disabled = true;
   try {
     const s = await api.createSession(readSettings());
+    closeMenu(); // 手机上：开始游戏后收起菜单
     stopRoomPolling();
     resetGameStatus();
     state.sessions.unshift({ id: s.id, name: s.name, created_at: s.created_at });
@@ -560,6 +596,7 @@ async function onCreateRoomClick() {
 }
 
 async function openSession(id) {
+  closeMenu(); // 手机上：选好游戏后收起菜单
   stopRoomPolling();
   resetGameStatus();
   state.currentId = id;
@@ -646,6 +683,9 @@ async function onEndClick() {
  * 绑定事件
  * ========================================================= */
 els.btnNew.onclick = newSession;
+els.btnMenu.onclick = openMenu;
+els.btnCloseMenu.onclick = closeMenu;
+els.backdrop.onclick = closeMenu;
 els.send.onclick = send;
 els.btnJoinRoom.onclick = onJoinClick;
 els.btnCreateRoom.onclick = onCreateRoomClick;
@@ -654,6 +694,8 @@ els.btnEnd.onclick = onEndClick;
 els.input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.isComposing) send(); // isComposing：输入法选字时按回车不发送
 });
+// 点输入框时，等键盘弹出来（大约 0.3 秒），再适配一次，确保能看到最新的消息
+els.input.addEventListener("focus", () => setTimeout(fitToViewport, 300));
 els.roomCodeInput.addEventListener("input", () => {
   els.roomCodeInput.value = els.roomCodeInput.value.toUpperCase(); // 房间码自动转大写
 });
@@ -662,4 +704,5 @@ els.roomCodeInput.addEventListener("keydown", (e) => {
 });
 
 els.nickname.value = loadNickname(); // 记住上次用的昵称
+fitToViewport();
 loadSessions();
