@@ -1,101 +1,64 @@
 /* =========================================================
  * 配置
- * USE_MOCK = true  : 不需要后端，用假数据先跑通前端
- * USE_MOCK = false : 调用你写的 Python 后端
- * API_BASE 留空表示和页面同源（比如后端在 localhost:8000 同时托管这个页面）
+ * API_BASE 留空表示和页面同源（后端在 localhost:8000 同时托管这个页面）
  * ========================================================= */
-const USE_MOCK = false;
 const API_BASE = "";
+const GRACE_MS = 2500; // 倒计时到 0 后等一会儿再通知后端（后端有 2 秒余量）
+const RING_CIRCUMFERENCE = 2 * Math.PI * 19; // 圆环周长，和 SVG 里的 r="19" 对应
 
 /* =========================================================
- * API 层 —— 后端只需实现下面这 5 个接口
+ * API 层
  * ========================================================= */
 const api = {
   // GET /api/sessions -> [{id, name, created_at}]
   listSessions: () => request("GET", "/api/sessions"),
 
-  // POST /api/sessions -> {id, name, created_at, messages:[{role, content}]}
-  // 新建会话时，后端让 AI 出第一道题，放在 messages 里返回
-  createSession: () => request("POST", "/api/sessions"),
+  // POST /api/sessions  body: {rounds, seconds}
+  // -> {id, name, created_at, messages, turn_limit, win_rounds}
+  createSession: (settings) => request("POST", "/api/sessions", settings),
 
   // DELETE /api/sessions/{id} -> {ok: true}
   deleteSession: (id) => request("DELETE", `/api/sessions/${id}`),
 
-  // GET /api/sessions/{id}/messages -> [{role: "user"|"assistant", content}]
+  // GET /api/sessions/{id}/messages -> [{role, content}]
   getMessages: (id) => request("GET", `/api/sessions/${id}/messages`),
 
-  // POST /api/sessions/{id}/chat  body: {message} -> {reply}
+  // POST /api/sessions/{id}/chat  body: {message}
+  // -> {reply, status, rounds, turn_limit}
   chat: (id, message) => request("POST", `/api/sessions/${id}/chat`, { message }),
 };
 
 async function request(method, path, body) {
-  if (USE_MOCK) return mock(method, path, body);
   const res = await fetch(API_BASE + path, {
     method,
     headers: body ? { "Content-Type": "application/json" } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
-  if (!res.ok) throw new Error(`${method} ${path} 失败：HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`${method} ${path} failed: HTTP ${res.status}`);
   return res.json();
 }
 
 /* =========================================================
- * Mock 后端（写好真后端后把 USE_MOCK 改成 false 即可）
- * ========================================================= */
-const mockDB = { sessions: [], messages: {} };
-const riddles = [["一箭穿心", "必"], ["半部春秋", "秦"], ["七十二小时", "晶"], ["一口咬掉牛尾巴", "告"]];
-let mockAnswer = {};
-function mock(method, path, body) {
-  return new Promise((resolve) => setTimeout(() => {
-    const m = path.match(/^\/api\/sessions\/?([^/]*)\/?(\w*)$/);
-    const id = m[1], action = m[2];
-    const newRiddle = (sid) => {
-      const r = riddles[Math.floor(Math.random() * riddles.length)];
-      mockAnswer[sid] = r[1];
-      return `谜面：${r[0]}（打一字）`;
-    };
-    if (method === "GET" && !id) return resolve([...mockDB.sessions].reverse());
-    if (method === "POST" && !id) {
-      const now = new Date();
-      const s = { id: String(now.getTime()), name: formatTime(now), created_at: now.toISOString() };
-      mockDB.sessions.push(s);
-      mockDB.messages[s.id] = [{ role: "assistant", content: newRiddle(s.id) }];
-      return resolve({ ...s, messages: mockDB.messages[s.id] });
-    }
-    if (method === "DELETE") {
-      mockDB.sessions = mockDB.sessions.filter((s) => s.id !== id);
-      delete mockDB.messages[id];
-      return resolve({ ok: true });
-    }
-    if (method === "GET" && action === "messages") return resolve(mockDB.messages[id] || []);
-    if (method === "POST" && action === "chat") {
-      const msgs = mockDB.messages[id];
-      msgs.push({ role: "user", content: body.message });
-      let reply;
-      if (/来|再|新|下一/.test(body.message)) reply = newRiddle(id);
-      else if (body.message.includes(mockAnswer[id])) reply = `太棒了！答对了！就是“${mockAnswer[id]}”字！要不要再来一题？`;
-      else reply = "差一点点哦～再想想谜面里的每个字分别对应什么部件？";
-      msgs.push({ role: "assistant", content: reply });
-      return resolve({ reply });
-    }
-    resolve(null);
-  }, 400));
-}
-
-/* =========================================================
- * 页面逻辑
+ * 页面元素和状态
  * ========================================================= */
 const $ = (id) => document.getElementById(id);
 const els = {
   list: $("sessionList"), messages: $("messages"), name: $("sessionName"),
   input: $("input"), send: $("btnSend"), btnNew: $("btnNew"), toast: $("toast"),
+  rounds: $("roundsInput"), seconds: $("secondsInput"),
+  timer: $("timer"), progress: $("progress"),
+  ring: $("timerRing"), ringFg: $("ringFg"), ringNum: $("ringNum"),
 };
-const state = { sessions: [], currentId: null, sending: false };
-
-function formatTime(d) {
-  const p = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
-}
+const state = {
+  sessions: [], currentId: null, sending: false,
+  // 当前这一局的游戏状态
+  status: "idle",      // "idle" / "playing" / "won" / "lost"
+  rounds: null,        // 已接上的词数；null 表示还不知道（打开的是旧游戏）
+  winRounds: 10,
+  turnLimit: 10,
+  deadline: 0,         // 这一回合的截止时间（毫秒时间戳）
+  timerId: null,
+};
 
 function toast(text) {
   els.toast.textContent = text;
@@ -104,10 +67,107 @@ function toast(text) {
   toast.t = setTimeout(() => (els.toast.style.display = "none"), 2500);
 }
 
+/* =========================================================
+ * 倒计时
+ * ========================================================= */
+function startTimer(seconds) {
+  state.deadline = Date.now() + seconds * 1000;
+  resumeTimer();
+}
+
+function resumeTimer() {
+  pauseTimer();
+  tick();
+  state.timerId = setInterval(tick, 100);
+}
+
+function pauseTimer() {
+  clearInterval(state.timerId);
+  state.timerId = null;
+}
+
+function tick() {
+  const leftMs = Math.max(0, state.deadline - Date.now());
+  const remain = Math.ceil(leftMs / 1000);
+  const ratio = leftMs / (state.turnLimit * 1000);
+
+  els.ring.hidden = false;
+  els.timer.textContent = "";
+  els.ringNum.textContent = remain;
+  els.ringFg.style.strokeDashoffset = RING_CIRCUMFERENCE * (1 - ratio);
+  els.ring.classList.toggle("warn", remain <= 3);
+
+  if (leftMs === 0) {
+    pauseTimer();
+    onTimeout();
+  }
+}
+
+// 显示游戏结束的文字，收起圆环
+function showEndText(text, cls) {
+  pauseTimer();
+  els.ring.hidden = true;
+  els.timer.textContent = text;
+  els.timer.className = cls;
+}
+
+// 时间到：先锁住输入，再通知后端记录失败
+async function onTimeout() {
+  if (state.status !== "playing" || state.sending) return;
+  state.sending = true;
+  setInputEnabled(false);
+  showEndText("⏰ Time's up!", "warn");
+  const typing = addTyping();
+  setTimeout(async () => {
+    try {
+      const res = await api.chat(state.currentId, "");
+      typing.remove();
+      handleReply(res);
+    } catch (e) {
+      typing.remove();
+      toast(e.message);
+    } finally {
+      state.sending = false;
+    }
+  }, GRACE_MS);
+}
+
+function updateProgress() {
+  els.progress.textContent =
+    state.rounds === null ? "" : `Round ${state.rounds}/${state.winRounds}`;
+}
+
+// 根据后端返回的状态更新页面
+function handleReply(res) {
+  addMessage("assistant", res.reply);
+  const prevRounds = state.rounds;
+  state.status = res.status;
+  state.rounds = res.rounds;
+  state.turnLimit = res.turn_limit;
+  updateProgress();
+
+  if (res.status === "won") {
+    showEndText("🎉 You win!", "done");
+    setInputEnabled(false);
+  } else if (res.status === "lost") {
+    showEndText("💀 Game over", "warn");
+    setInputEnabled(false);
+  } else if (prevRounds === null || res.rounds > prevRounds) {
+    startTimer(res.turn_limit); // 接词成功：新回合，重新计时
+    setInputEnabled(true);
+  } else {
+    resumeTimer();              // 答错了：计时继续，不重置
+    setInputEnabled(true);
+  }
+}
+
+/* =========================================================
+ * 渲染
+ * ========================================================= */
 function renderSessions() {
   els.list.innerHTML = "";
   if (!state.sessions.length) {
-    els.list.innerHTML = '<li class="empty-tip">还没有游戏记录</li>';
+    els.list.innerHTML = '<li class="empty-tip">No games yet</li>';
     return;
   }
   for (const s of state.sessions) {
@@ -115,12 +175,12 @@ function renderSessions() {
     li.className = "session-item" + (s.id === state.currentId ? " active" : "");
     const btn = document.createElement("button");
     btn.className = "session-btn";
-    btn.textContent = "🧩 " + s.name;
+    btn.textContent = "🔗 " + s.name;
     btn.onclick = () => openSession(s.id);
     const del = document.createElement("button");
     del.className = "btn-del";
     del.textContent = "✕";
-    del.setAttribute("aria-label", "删除 " + s.name);
+    del.setAttribute("aria-label", "Delete " + s.name);
     del.onclick = () => removeSession(s.id);
     li.append(btn, del);
     els.list.appendChild(li);
@@ -159,6 +219,32 @@ function setInputEnabled(on) {
   if (on) els.input.focus();
 }
 
+function resetGameStatus() {
+  pauseTimer();
+  els.ring.hidden = true;
+  state.status = "idle";
+  state.rounds = null;
+  els.timer.textContent = "";
+  els.timer.className = "";
+  updateProgress();
+}
+
+// 读取设置框，限制在后端允许的范围内
+function readSettings() {
+  const clamp = (v, min, max, def) => {
+    const n = parseInt(v, 10);
+    return Number.isNaN(n) ? def : Math.min(max, Math.max(min, n));
+  };
+  const rounds = clamp(els.rounds.value, 3, 50, 10);
+  const seconds = clamp(els.seconds.value, 5, 60, 10);
+  els.rounds.value = rounds;
+  els.seconds.value = seconds;
+  return { rounds, seconds };
+}
+
+/* =========================================================
+ * 操作
+ * ========================================================= */
 async function loadSessions() {
   try {
     state.sessions = await api.listSessions();
@@ -169,37 +255,49 @@ async function loadSessions() {
 async function newSession() {
   els.btnNew.disabled = true;
   try {
-    const s = await api.createSession();
+    const s = await api.createSession(readSettings());
+    resetGameStatus();
     state.sessions.unshift({ id: s.id, name: s.name, created_at: s.created_at });
     state.currentId = s.id;
-    els.name.textContent = "会话名称：" + s.name;
+    els.name.textContent = "Game: " + s.name;
     renderSessions();
     renderMessages(s.messages || []);
+
+    state.status = "playing";
+    state.rounds = 0;
+    state.winRounds = s.win_rounds;
+    state.turnLimit = s.turn_limit;
+    updateProgress();
+    startTimer(s.turn_limit);
     setInputEnabled(true);
   } catch (e) { toast(e.message); }
   finally { els.btnNew.disabled = false; }
 }
 
 async function openSession(id) {
+  resetGameStatus();
   state.currentId = id;
   const s = state.sessions.find((x) => x.id === id);
-  els.name.textContent = "会话名称：" + (s ? s.name : id);
+  els.name.textContent = "Game: " + (s ? s.name : id);
   renderSessions();
   try {
     renderMessages(await api.getMessages(id));
+    // 旧游戏不知道还剩多少时间，等发送下一个词时由后端判定
+    state.status = "playing";
     setInputEnabled(true);
   } catch (e) { toast(e.message); }
 }
 
 async function removeSession(id) {
-  if (!confirm("确定删除这条游戏记录吗？")) return;
+  if (!confirm("Delete this game?")) return;
   try {
     await api.deleteSession(id);
     state.sessions = state.sessions.filter((s) => s.id !== id);
     if (state.currentId === id) {
       state.currentId = null;
-      els.name.textContent = "未选择会话";
-      els.messages.innerHTML = '<div class="welcome"><div class="big">🧩</div>点击左侧「新建游戏」开始猜字谜</div>';
+      resetGameStatus();
+      els.name.textContent = "No game selected";
+      els.messages.innerHTML = '<div class="welcome"><div class="big">🔤</div>Click “New game” on the left to start a chain</div>';
       setInputEnabled(false);
     }
     renderSessions();
@@ -208,29 +306,31 @@ async function removeSession(id) {
 
 async function send() {
   const text = els.input.value.trim();
-  if (!text || !state.currentId || state.sending) return;
+  if (!text || !state.currentId || state.sending || state.status !== "playing") return;
   state.sending = true;
   els.input.value = "";
   addMessage("user", text);
   setInputEnabled(false);
+  pauseTimer(); // 等待回复时暂停显示；截止时间不变
   const typing = addTyping();
   try {
-    const { reply } = await api.chat(state.currentId, text);
+    const res = await api.chat(state.currentId, text);
     typing.remove();
-    addMessage("assistant", reply);
+    handleReply(res);
   } catch (e) {
     typing.remove();
     toast(e.message);
+    resumeTimer();
+    setInputEnabled(true);
   } finally {
     state.sending = false;
-    setInputEnabled(true);
   }
 }
 
 els.btnNew.onclick = newSession;
 els.send.onclick = send;
 els.input.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.isComposing) send(); // isComposing：中文输入法选字时按回车不发送
+  if (e.key === "Enter" && !e.isComposing) send(); // isComposing：输入法选字时按回车不发送
 });
 
 loadSessions();

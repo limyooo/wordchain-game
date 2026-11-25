@@ -8,6 +8,7 @@
   --accent: #7c6cf0;
   --accent-2: #9b6cf0;
   --danger: #e5484d;
+  --success: #3fb950;
   --bubble-ai: #2a2d42;
   --bubble-user: #6d5ce8;
 }
@@ -39,7 +40,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .sidebar h1 { font-size: 16px; margin-bottom: 22px; display: flex; gap: 8px; align-items: center; }
 .btn-new {
   background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  color: #fff; border-radius: 8px; padding: 10px; margin-bottom: 18px;
+  color: #fff; border-radius: 8px; padding: 10px; margin-bottom: 14px;
 }
 .btn-new:hover { filter: brightness(1.1); }
 .btn-new:disabled { opacity: .6; cursor: wait; }
@@ -57,6 +58,23 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .btn-del { background: none; color: var(--danger); font-size: 16px; padding: 4px 6px; border-radius: 4px; }
 .btn-del:hover { background: rgba(229,72,77,.15); }
 .empty-tip { color: var(--muted); font-size: 12px; padding: 8px 2px; }
+
+/* ---------- 左侧：游戏设置 ---------- */
+.settings {
+  display: flex; flex-direction: column; gap: 8px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; margin-bottom: 18px;
+}
+.settings label {
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--muted);
+}
+.settings input {
+  width: 56px; padding: 4px 6px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg);
+  color: var(--text); font: inherit; text-align: center;
+}
+.settings input:focus { outline: none; border-color: var(--accent); }
 
 /* ---------- 中间：聊天 ---------- */
 .chat { display: flex; flex-direction: column; min-height: 0; }
@@ -84,7 +102,6 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .typing span:nth-child(2) { animation-delay: .2s; }
 .typing span:nth-child(3) { animation-delay: .4s; }
 @keyframes blink { 0%, 80%, 100% { opacity: .2; } 40% { opacity: 1; } }
-@media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .6; } }
 
 .welcome { margin: auto; text-align: center; color: var(--muted); line-height: 1.9; }
 .welcome .big { font-size: 40px; margin-bottom: 8px; }
@@ -104,6 +121,32 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 }
 .btn-send:disabled, .input-wrap input:disabled { opacity: .5; cursor: not-allowed; }
 
+/* ---------- 顶部：进度和倒计时 ---------- */
+.game-status { display: flex; gap: 16px; align-items: center; font-weight: 600; font-size: 15px; }
+#progress { color: var(--muted); font-size: 13px; }
+#timer.warn { color: var(--danger); }
+#timer.done { color: var(--success); }
+
+.timer-ring { position: relative; width: 52px; height: 52px; }
+.timer-ring[hidden] { display: none; }
+.timer-ring svg { width: 100%; height: 100%; transform: rotate(-90deg); /* 从 12 点钟方向开始 */ }
+.ring-bg { fill: none; stroke: var(--panel-2); stroke-width: 4; }
+.ring-fg {
+  fill: none; stroke: var(--accent); stroke-width: 4; stroke-linecap: round;
+  stroke-dasharray: 119.38;  /* 圆的周长：2 × π × 19 */
+  stroke-dashoffset: 0;
+  transition: stroke-dashoffset 0.1s linear, stroke 0.3s;
+}
+.ring-num {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 16px; font-weight: 700;
+}
+.timer-ring.warn .ring-fg { stroke: var(--danger); }
+.timer-ring.warn .ring-num { color: var(--danger); }
+.timer-ring.warn { animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse { 50% { transform: scale(1.08); } }
+
 /* ---------- 右侧：游戏简介 ---------- */
 .intro {
   background: var(--panel); border-left: 1px solid var(--border);
@@ -112,6 +155,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .intro h3 { font-size: 16px; margin-bottom: 12px; }
 .intro h4 { font-size: 14px; margin: 18px 0 6px; }
 .intro p { color: #c7c9d9; }
+.intro p + p { margin-top: 8px; }
 .intro ul { padding-left: 18px; color: #c7c9d9; }
 .intro li { margin-bottom: 4px; }
 .intro b { color: var(--text); }
@@ -121,6 +165,12 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
   position: fixed; left: 50%; top: 20px; transform: translateX(-50%);
   background: var(--danger); color: #fff; padding: 8px 16px; border-radius: 6px;
   display: none; z-index: 10;
+}
+
+/* 系统设置了“减少动态效果”的用户：关掉闪烁和跳动 */
+@media (prefers-reduced-motion: reduce) {
+  .typing span { animation: none; opacity: .6; }
+  .timer-ring.warn { animation: none; }
 }
 
 @media (max-width: 1000px) {

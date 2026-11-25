@@ -12,6 +12,14 @@
   <aside class="sidebar">
     <h1>🔗 WordChain</h1>
     <button class="btn-new" id="btnNew">✨ New game</button>
+    <div class="settings">
+      <label>Rounds to win
+        <input type="number" id="roundsInput" min="3" max="50" value="10" />
+      </label>
+      <label>Seconds per turn
+        <input type="number" id="secondsInput" min="5" max="60" value="10" />
+      </label>
+    </div>
     <div class="section-title">Game history</div>
     <ul class="session-list" id="sessionList"></ul>
   </aside>
@@ -22,6 +30,17 @@
       <div>
         <h2>🔗 WordChain</h2>
         <div class="sub" id="sessionName">No game selected</div>
+      </div>
+      <div class="game-status">
+        <span id="progress"></span>
+        <span id="timer"></span>
+        <div class="timer-ring" id="timerRing" hidden>
+          <svg viewBox="0 0 44 44" aria-hidden="true">
+            <circle class="ring-bg" cx="22" cy="22" r="19" />
+            <circle class="ring-fg" id="ringFg" cx="22" cy="22" r="19" />
+          </svg>
+          <span class="ring-num" id="ringNum"></span>
+        </div>
       </div>
     </div>
     <div class="messages" id="messages">
@@ -43,12 +62,14 @@
     <h3>🔗 About the game</h3>
     <p>WordChain is an AI-powered English word chain game for anyone who wants to build their vocabulary. Take turns with an AI partner and see how long you can keep the chain going!</p>
     <h4>🎮 How to play</h4>
-    <p>The AI starts with a word, like “apple”. Reply with a word that starts with its last letter (“egg”), then the AI continues from your word’s last letter (“goat”), and so on. Each word must be a real English word and can only be used once per game.</p>
+    <p>The AI starts with a word, like “apple”. Reply with a word that starts with its last letter (“egg”), then the AI continues from your word’s last letter (“goat”), and so on. Each word must be a real English word, at least 3 letters long, and can only be used once per game.</p>
+    <p>Answer before the timer runs out. Keep the chain going for enough rounds and you win!</p>
     <h4>✨ Features</h4>
     <ul>
-      <li><b>Instant rule checks:</b> wrong first letters and repeated words are caught right away</li>
+      <li><b>Instant rule checks:</b> wrong first letters, made-up words and repeats are caught right away</li>
       <li><b>Smart AI partner:</b> the AI picks words that keep the game fun and challenging</li>
-      <li><b>Helpful hints:</b> stuck? Ask for a hint instead of giving up</li>
+      <li><b>Timed turns:</b> beat the clock on every turn</li>
+      <li><b>Your difficulty:</b> choose how many rounds to win and how many seconds per turn</li>
       <li><b>Saved games:</b> your history is saved, so you can return to any game</li>
     </ul>
     <h4>👥 Great for</h4>

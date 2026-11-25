@@ -1,16 +1,22 @@
 import json
 import os
 import random
+import time
 from datetime import datetime
 
 import anthropic
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from mangum import Mangum
+from pydantic import BaseModel, Field
 from starlette.responses import FileResponse
 
-from mangum import Mangum
 app = FastAPI(title="wordchain")
+
+# ---------- 游戏设置（默认值，玩家可以在新建游戏时修改） ----------
+DEFAULT_TURN_LIMIT = 10  # 每回合限时（秒）
+DEFAULT_WIN_ROUNDS = 10  # 撑过这么多轮就赢
+GRACE_SECONDS = 2        # 给网络延迟留一点余量
 
 
 # ---------- 数据模型 ----------
@@ -27,17 +33,28 @@ class SessionInfo(BaseModel):
 
 
 class Session(SessionInfo):
-    """新建会话时返回：在 SessionInfo 基础上多了 messages"""
+    """新建会话时返回：多了 messages 和这一局的设置"""
     messages: list[Message]
+    turn_limit: int = DEFAULT_TURN_LIMIT
+    win_rounds: int = DEFAULT_WIN_ROUNDS
 
 
 class GameSession(Session):
     """存进文件的完整数据：比返回给前端的 Session 多了游戏状态"""
     used_words: list[str]
+    status: str             # "playing" / "won" / "lost"
+    rounds: int             # 玩家成功接上的词数
+    turn_started_at: float  # 这一回合开始的时间（秒）
 
 
 class OkResponse(BaseModel):
     ok: bool
+
+
+class NewGameRequest(BaseModel):
+    """新建游戏时玩家的设置，Field 会自动检查范围"""
+    rounds: int = Field(DEFAULT_WIN_ROUNDS, ge=3, le=50)
+    seconds: int = Field(DEFAULT_TURN_LIMIT, ge=5, le=60)
 
 
 class ChatRequest(BaseModel):
@@ -46,6 +63,10 @@ class ChatRequest(BaseModel):
 
 class ChatReply(BaseModel):
     reply: str
+    status: str   # "playing" / "won" / "lost"，前端用来决定要不要继续倒计时
+    rounds: int
+    turn_limit: int
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -117,10 +138,21 @@ def check_word(word: str, used_words: list[str]) -> str | None:
 
 
 # ---------- AI ----------
-if not os.environ.get("ANTHROPIC_API_KEY"):
-    print("WARNING: ANTHROPIC_API_KEY is not set, AI will not work")
+def load_api_key() -> str | None:
+    """本地：从环境变量读取。Lambda 上：从 Secrets Manager 读取。"""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        return key
+    secret_arn = os.environ.get("ANTHROPIC_SECRET_ARN")
+    if secret_arn:
+        import boto3  # Lambda 自带 boto3，本地不需要安装
+        resp = boto3.client("secretsmanager").get_secret_value(SecretId=secret_arn)
+        return resp["SecretString"]
+    print("WARNING: no API key found, AI will not work")
+    return None
 
-client = anthropic.Anthropic()  # 自动从环境变量 ANTHROPIC_API_KEY 读取 key
+
+client = anthropic.Anthropic(api_key=load_api_key())
 MODEL = "claude-haiku-5-5"
 
 # 开局词：从这些常用词里随机挑一个
@@ -173,9 +205,10 @@ def list_sessions():
     return sessions
 
 
-# 新建会话
+# 新建会话：可以带上玩家的设置，不带就用默认值
 @app.post("/api/sessions", response_model=Session)
-def create_session():
+def create_session(req: NewGameRequest | None = None):
+    settings = req or NewGameRequest()
     now = datetime.now()
     sid = generate_session_id(now)
 
@@ -186,10 +219,17 @@ def create_session():
         "name": sid,
         "created_at": now.isoformat(),
         "used_words": [first_word],  # 本局用过的词，最后一个就是“上一个词”
+        "status": "playing",
+        "rounds": 0,
+        "turn_limit": settings.seconds,
+        "win_rounds": settings.rounds,
+        "turn_started_at": time.time(),  # 第一回合从现在开始计时
         "messages": [{
             "role": "assistant",
             "content": f"Let's play! My word is '{first_word}'. "
-                       f"Your turn: give me a word starting with '{first_word[-1]}'.",
+                       f"Your turn: give me a word starting with '{first_word[-1]}'. "
+                       f"You have {settings.seconds} seconds per turn. "
+                       f"Survive {settings.rounds} rounds to win!",
         }],
     }
     save_session(data)
@@ -214,29 +254,67 @@ def get_messages(sid: str):
 @app.post("/api/sessions/{sid}/chat", response_model=ChatReply)
 def chat(sid: str, req: ChatRequest):
     data = load_session(sid)
-    word = req.message.strip().lower()  # 去掉空格、转小写，"Egg " 也算 "egg"
-    data["messages"].append({"role": "user", "content": req.message})
+    # 旧存档没有这些字段，给默认值
+    data.setdefault("status", "playing")
+    data.setdefault("rounds", 0)
+    data.setdefault("turn_started_at", time.time())
+    data.setdefault("turn_limit", DEFAULT_TURN_LIMIT)
+    data.setdefault("win_rounds", DEFAULT_WIN_ROUNDS)
+    turn_limit = data["turn_limit"]
+    win_rounds = data["win_rounds"]
 
+    def result(reply: str) -> dict:
+        """记下 AI 的回复、保存、返回给前端"""
+        data["messages"].append({"role": "assistant", "content": reply})
+        save_session(data)
+        return {"reply": reply, "status": data["status"],
+                "rounds": data["rounds"], "turn_limit": turn_limit}
+
+    # 1. 游戏已经结束：不再接受新的词
+    if data["status"] != "playing":
+        return {"reply": "This game is over. Click 'New game' to play again!",
+                "status": data["status"], "rounds": data["rounds"], "turn_limit": turn_limit}
+
+    word = req.message.strip().lower()  # 去掉空格、转小写，"Egg " 也算 "egg"
+    if word:
+        data["messages"].append({"role": "user", "content": req.message})
+
+    # 2. 先看有没有超时（后端判定，前端改不了）
+    elapsed = time.time() - data["turn_started_at"]
+    if elapsed > turn_limit + GRACE_SECONDS:
+        data["status"] = "lost"
+        return result(f"Time's up! You took more than {turn_limit} seconds. "
+                      f"You survived {data['rounds']} rounds. Game over!")
+
+    # 3. 检查规则：答错只提示，计时不重置
     error = check_word(word, data["used_words"])
     if error:
-        reply = error
-    else:
-        data["used_words"].append(word)
-        ai_word = ai_next_word(data["used_words"])
-        if ai_word is None:
-            reply = f"I can't think of a word starting with '{word[-1]}'. You win!"
-        else:
-            data["used_words"].append(ai_word)
-            reply = (f"Nice! My word is '{ai_word}'. "
-                     f"Your turn: a word starting with '{ai_word[-1]}'.")
+        return result(error)
 
-    data["messages"].append({"role": "assistant", "content": reply})
-    save_session(data)
-    return {"reply": reply}
+    data["used_words"].append(word)
+    data["rounds"] += 1
+
+    # 4. 撑过设定的轮数：胜利
+    if data["rounds"] >= win_rounds:
+        data["status"] = "won"
+        return result(f"Amazing! You survived {win_rounds} rounds. You win! 🎉")
+
+    # 5. 让 AI 接词
+    ai_word = ai_next_word(data["used_words"])
+    if ai_word is None:
+        data["status"] = "won"
+        return result(f"I can't think of a word starting with '{word[-1]}'. You win! 🎉")
+
+    data["used_words"].append(ai_word)
+    data["turn_started_at"] = time.time()  # AI 说完话，新回合开始计时
+    return result(f"Nice! ({data['rounds']}/{win_rounds}) My word is '{ai_word}'. "
+                  f"Your turn: a word starting with '{ai_word[-1]}'.")
+
+
+# Lambda 的入口：Mangum 把 Lambda 的请求翻译成 FastAPI 能懂的格式
+handler = Mangum(app)
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-    # Lambda 的入口：Mangum 把 Lambda 的请求翻译成 FastAPI 能懂的格式
-    handler = Mangum(app)
